@@ -130,7 +130,7 @@ All tools accept an optional `fileKey` parameter when multiple Figma files are c
 
 - `export_fig` uses Figma desktop's **Save local copy** action; it does not synthesize a .fig file from plugin exports. The intended document must be the active Figma window.
 - Supported on macOS and Windows only. The MCP server must run on the same desktop machine as Figma. On macOS, allow the terminal/Node process to control Figma through Accessibility / Automation permissions. On Windows, the desktop session must be unlocked and Figma must be open.
-- The tool activates Figma, invokes the Action menu shortcut, selects **Save local copy**, waits for a matching completed `.fig` file in the current user's Downloads folder, then copies it to `outputPath`. If Figma displays a save dialog, complete it before the timeout. Existing destination files are never overwritten.
+- The tool activates Figma, invokes the Action menu shortcut, selects **Save local copy**, waits for a matching completed `.fig` file in the current user's Downloads folder, then copies it to `outputPath` (creating the destination directory if needed). The original `.fig` download in `Downloads` is kept. If Figma displays a save dialog, complete it before the timeout. Existing destination files are never overwritten.
 - Pass the document's exact name (without the extension) as `fileName`. If multiple Figma documents are open, make sure the intended one is the active window before calling the tool. The optional `timeoutMs` defaults to 120 seconds and is capped at 5 minutes.
 - Figma may disable local copies when the file owner or organization restricts copying/export. In that case the tool reports a timeout; it cannot bypass Figma permissions.
 
