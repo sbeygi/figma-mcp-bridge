@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { constants } from "node:fs";
-import { copyFile, readdir, stat, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -30,7 +30,38 @@ function normalizedFileStem(value: string): string {
 function matchesExpectedName(candidatePath: string, expectedName: string): boolean {
   const expected = normalizedFileStem(expectedName);
   const actual = normalizedFileStem(candidatePath);
-  return actual === expected || new RegExp(`^${expected}\\d+$`).test(actual);
+  if (!expected) return false;
+  return actual === expected || new RegExp(`^${expected}\\d+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { constants } from "node:fs";
+import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { homedir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { z } from "zod";
+
+const execFileAsync = promisify(execFile);
+const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 300_000;
+const POLL_INTERVAL_MS = 500;
+const REQUIRED_STABLE_POLLS = 3;
+
+interface FigFile {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+function normalizedFileStem(value: string): string {
+  return path
+    .basename(value, path.extname(value))
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function matchesExpectedName(candidatePath: string, expectedName: string): boolean {
+).test(actual);
 }
 
 async function listFigFiles(downloadDir: string): Promise<FigFile[]> {
@@ -157,6 +188,10 @@ export async function exportNativeFigFile(
     throw new Error(`timeoutMs must be an integer between 5000 and ${MAX_TIMEOUT_MS}.`);
   }
 
+  if (!normalizedFileStem(fileName)) {
+    throw new Error("fileName must contain at least one letter or number.");
+  }
+
   const downloadDir = path.join(homedir(), "Downloads");
   const before = await listFigFiles(downloadDir);
   const baseline = new Map(before.map((file) => [file.path, `${file.size}:${file.mtimeMs}`]));
@@ -172,7 +207,16 @@ export async function exportNativeFigFile(
     timeoutMs
   );
 
+  if (path.resolve(downloaded.path) === destination) {
+    return {
+      outputPath: destination,
+      bytesWritten: downloaded.size,
+      sourceFileName: path.basename(downloaded.path),
+    };
+  }
+
   try {
+    await mkdir(path.dirname(destination), { recursive: true });
     await copyFile(downloaded.path, destination, constants.COPYFILE_EXCL);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -187,7 +231,8 @@ export async function exportNativeFigFile(
     throw error;
   }
 
-  await unlink(downloaded.path);
+  // Keep the original Downloads copy intact; exporting elsewhere must not
+  // silently remove the file Figma just created.
   return {
     outputPath: destination,
     bytesWritten: downloaded.size,
@@ -198,7 +243,7 @@ export async function exportNativeFigFile(
 export function registerFigExportTool(server: McpServer): void {
   server.tool(
     "export_fig",
-    "Save the active Figma desktop document as a native .fig file and move the completed download to outputPath. This uses Figma's File > Save local copy action; the intended document must be the active Figma window. Supported on macOS and Windows only.",
+    "Save the active Figma desktop document as a native .fig file and copy the completed download to outputPath (the original Downloads file is kept). This uses Figma's File > Save local copy action; the intended document must be the active Figma window. Supported on macOS and Windows only.",
     {
       fileName: z
         .string()
