@@ -48,6 +48,7 @@ import {
 } from "./schema.js";
 import type { BridgeResponse } from "./types.js";
 import { Follower } from "./follower.js";
+import { registerFigExportTool } from "./fig-export.js";
 
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15_000;
@@ -110,6 +111,7 @@ interface SaveScreenshotItemResult {
  * @param port - The port used for follower-to-leader HTTP calls.
  */
 export function registerTools(server: McpServer, node: Node, port: number): void {
+  registerFigExportTool(server);
   server.tool(
     "list_files",
     "List all currently connected Figma/FigJam files. Returns fileKey and fileName for each. Use the fileKey to target a specific file in other tools.",
