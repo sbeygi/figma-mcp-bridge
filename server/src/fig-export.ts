@@ -31,37 +31,7 @@ function matchesExpectedName(candidatePath: string, expectedName: string): boole
   const expected = normalizedFileStem(expectedName);
   const actual = normalizedFileStem(candidatePath);
   if (!expected) return false;
-  return actual === expected || new RegExp(`^${expected}\\d+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { constants } from "node:fs";
-import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { homedir } from "node:os";
-import path from "node:path";
-import { promisify } from "node:util";
-import { z } from "zod";
-
-const execFileAsync = promisify(execFile);
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 300_000;
-const POLL_INTERVAL_MS = 500;
-const REQUIRED_STABLE_POLLS = 3;
-
-interface FigFile {
-  path: string;
-  size: number;
-  mtimeMs: number;
-}
-
-function normalizedFileStem(value: string): string {
-  return path
-    .basename(value, path.extname(value))
-    .normalize("NFKC")
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]/gu, "");
-}
-
-function matchesExpectedName(candidatePath: string, expectedName: string): boolean {
-).test(actual);
+  return actual === expected || new RegExp(`^${expected}\\\\d+$`).test(actual);
 }
 
 async function listFigFiles(downloadDir: string): Promise<FigFile[]> {
@@ -95,7 +65,7 @@ async function triggerFigmaSaveLocalCopy(): Promise<void> {
       'tell application "Figma" to activate',
       'tell application "System Events"',
       '  tell process "Figma"',
-      '    set frontmost to true',
+      "    set frontmost to true",
       '    keystroke "k" using {command down}',
       "    delay 1",
       '    keystroke "Save local copy"',
@@ -179,6 +149,9 @@ export async function exportNativeFigFile(
   if (!fileName.trim() || path.basename(fileName) !== fileName || /[\\/]/.test(fileName)) {
     throw new Error("fileName must be the Figma document name only, without a directory path.");
   }
+  if (!normalizedFileStem(fileName)) {
+    throw new Error("fileName must contain at least one letter or number.");
+  }
 
   const destination = path.resolve(outputPath);
   if (path.extname(destination).toLowerCase() !== ".fig") {
@@ -186,10 +159,6 @@ export async function exportNativeFigFile(
   }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 5_000 || timeoutMs > MAX_TIMEOUT_MS) {
     throw new Error(`timeoutMs must be an integer between 5000 and ${MAX_TIMEOUT_MS}.`);
-  }
-
-  if (!normalizedFileStem(fileName)) {
-    throw new Error("fileName must contain at least one letter or number.");
   }
 
   const downloadDir = path.join(homedir(), "Downloads");
@@ -225,7 +194,7 @@ export async function exportNativeFigFile(
     }
     if (code === "ENOENT") {
       throw new Error(
-        `The output directory does not exist: ${path.dirname(destination)}. Create it and retry.`
+        `Could not access the source or destination for ${destination}. Check that the Figma download still exists and the destination is writable.`
       );
     }
     throw error;
