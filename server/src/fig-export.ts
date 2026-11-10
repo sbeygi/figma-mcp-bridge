@@ -32,7 +32,7 @@ function matchesExpectedName(candidatePath: string, expectedName: string): boole
   const actual = normalizedFileStem(candidatePath);
   if (!expected) return false;
   const suffix = actual.startsWith(expected) ? actual.slice(expected.length) : "";
-  return actual === expected || (suffix.length > 0 && /^\\d+$/.test(suffix));
+  return actual === expected || (suffix.length > 0 && /^\d+$/.test(suffix));
 }
 
 async function listFigFiles(downloadDir: string): Promise<FigFile[]> {
