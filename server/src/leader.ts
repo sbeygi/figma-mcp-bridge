@@ -4,6 +4,7 @@ import type { Duplex } from "node:stream";
 import { Bridge } from "./bridge.js";
 import { validateRpc } from "./schema.js";
 import { executeSaveScreenshots, isRunScriptEnabled } from "./tools.js";
+import { exportNativeFigFile } from "./fig-export.js";
 import type { ExportFormat } from "./tools.js";
 import type { RPCRequest, RPCResponse } from "./types.js";
 import { VERSION } from "./version.js";
@@ -108,6 +109,19 @@ export class Leader {
           this.sendJSON(res, 200, {
             data: this.bridge.listConnectedFiles(),
           });
+          return;
+        }
+
+        // The local fixture-preparation runner uses the same native export implementation as the MCP tool.
+        // /rpc is loopback-only and rejects browser-originated requests above.
+        if (rpcReq.tool === "export_fig") {
+          const params = rpcReq.params ?? {};
+          const result = await exportNativeFigFile(
+            params.fileName as string,
+            params.outputPath as string,
+            params.timeoutMs as number | undefined
+          );
+          this.sendJSON(res, 200, { data: { success: true, ...result } });
           return;
         }
 

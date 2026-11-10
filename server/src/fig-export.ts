@@ -1,10 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { constants } from "node:fs";
-import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
+import { copyFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import WebSocket from "ws";
 import { z } from "zod";
 
 const execFileAsync = promisify(execFile);
@@ -60,7 +61,254 @@ async function listFigFiles(downloadDir: string): Promise<FigFile[]> {
   return files;
 }
 
-async function triggerFigmaSaveLocalCopy(): Promise<void> {
+interface CdpTarget {
+  type: string;
+  title: string;
+  webSocketDebuggerUrl: string;
+}
+
+interface CdpMessage {
+  id?: number;
+  result?: unknown;
+  error?: { message?: string };
+}
+
+async function triggerFigmaSaveViaCdp(fileName: string): Promise<void> {
+  const port = Number(process.env.FIGMA_CDP_PORT ?? 9222);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("FIGMA_CDP_PORT must be a valid TCP port number.");
+  }
+
+  let targets: CdpTarget[];
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    targets = (await response.json()) as CdpTarget[];
+  } catch {
+    throw new Error(
+      `Figma CDP is not reachable on port ${port}. Launch Figma with FIGMA_TEST=1 and --remote-debugging-port=${port}, then retry.`
+    );
+  }
+
+  const expectedTitle = normalizedFileStem(fileName);
+  const target = targets.find((candidate) => {
+    if (candidate.type !== "page" || !candidate.webSocketDebuggerUrl) return false;
+    const title = candidate.title.replace(/\s+[–-]\s+Figma$/i, "");
+    return normalizedFileStem(title) === expectedTitle;
+  });
+  if (!target) {
+    throw new Error(
+      `No open Figma editor tab named "${fileName}" was found through CDP on port ${port}.`
+    );
+  }
+
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  let nextId = 0;
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  const onMessage = (data: WebSocket.RawData) => {
+    let message: CdpMessage;
+    try {
+      message = JSON.parse(data.toString()) as CdpMessage;
+    } catch {
+      return;
+    }
+    if (message.id === undefined) return;
+    const request = pending.get(message.id);
+    if (!request) return;
+    pending.delete(message.id);
+    if (message.error) request.reject(new Error(message.error.message ?? "CDP command failed."));
+    else request.resolve(message.result);
+  };
+  socket.on("message", onMessage);
+
+  const command = (method: string, params: Record<string, unknown> = {}): Promise<unknown> => {
+    const id = ++nextId;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      socket.send(JSON.stringify({ id, method, params }), (error) => {
+        if (!error) return;
+        pending.delete(id);
+        reject(error);
+      });
+    });
+  };
+
+  const evaluate = async (expression: string): Promise<unknown> => {
+    const response = (await command("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    })) as { result?: { value?: unknown }; exceptionDetails?: { text?: string } };
+    if (response.exceptionDetails) {
+      throw new Error(response.exceptionDetails.text ?? "Figma rejected the save action.");
+    }
+    return response.result?.value;
+  };
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("Timed out connecting to Figma CDP.")),
+        5_000
+      );
+      socket.once("open", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      socket.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+
+    const editor = (await evaluate(
+      `({ title: document.title, hasMainMenu: !!document.querySelector("[data-tooltip='main-menu']") })`
+    )) as
+      | {
+          title?: string;
+          hasMainMenu?: boolean;
+        }
+      | undefined;
+    if (!editor?.hasMainMenu)
+      throw new Error(`The CDP tab for "${fileName}" is not a Figma design editor.`);
+    const actualTitle = (editor.title ?? "").replace(/\s+[–-]\s+Figma$/i, "");
+    if (normalizedFileStem(actualTitle) !== expectedTitle) {
+      throw new Error(`The active Figma editor is "${actualTitle}", not "${fileName}".`);
+    }
+
+    // Open the File submenu with CDP mouse input; this does not activate or focus the Figma window.
+    const rootMenuOpen = await evaluate(
+      `!![...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.trim() === "File")`
+    );
+    if (!rootMenuOpen) {
+      const opened = await evaluate(`(() => {
+        const button = document.querySelector("[data-tooltip='main-menu']");
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+      if (!opened) throw new Error("Could not open Figma's main menu through CDP.");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+
+    const saveActionVisible = await evaluate(
+      `!![...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.trim().startsWith("Save local copy"))`
+    );
+    if (!saveActionVisible) {
+      const fileMenuPoint = (await evaluate(`(() => {
+        const item = document.querySelector('[role="menuitem"][aria-controls^="mainMenu.file-menu"]');
+        if (!item) return null;
+        const rect = item.getBoundingClientRect();
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      })()`)) as { x: number; y: number } | null;
+      if (!fileMenuPoint) throw new Error("Figma's File submenu was not available through CDP.");
+
+      await command("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: fileMenuPoint.x,
+        y: fileMenuPoint.y,
+      });
+      await command("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: fileMenuPoint.x,
+        y: fileMenuPoint.y,
+        button: "left",
+        clickCount: 1,
+      });
+      await command("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: fileMenuPoint.x,
+        y: fileMenuPoint.y,
+        button: "left",
+        clickCount: 1,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+
+    const triggered = await evaluate(`(() => {
+      const item = [...document.querySelectorAll('[role="menuitem"]')]
+        .find((candidate) => candidate.textContent.trim().startsWith("Save local copy"));
+      if (!item) return false;
+      // Figma's own "save-as" handler dispatches SaveLocalFile.
+      item.click();
+      return true;
+    })()`);
+    if (!triggered)
+      throw new Error("Figma's Save local copy action was not found in the File menu.");
+  } finally {
+    socket.off("message", onMessage);
+    for (const request of pending.values()) request.reject(new Error("CDP connection closed."));
+    pending.clear();
+    socket.close();
+  }
+}
+
+async function completeWindowsSaveDialog(fileName: string): Promise<void> {
+  const expectedDownloadName = `${fileName}.fig`.replace(/'/g, "''");
+  const script = `
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class FigmaSaveDialog { [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l); }
+'@
+$p = Get-Process Figma -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if (-not $p) { throw 'Could not find the Figma desktop process.' }
+$deadline = (Get-Date).AddSeconds(10)
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+$result = 'download'
+$saveClicked = $false
+while ((Get-Date) -lt $deadline) {
+  $items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  $confirm = $items | Where-Object { $_.Current.Name -eq 'Confirm Save As' } | Select-Object -First 1
+  if ($confirm) {
+    $children = $confirm.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $message = $children | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text } | Select-Object -First 1
+    if (-not $message -or $message.Current.Name -notlike '*${expectedDownloadName} already exists*') { throw 'Unexpected Figma overwrite prompt; refusing to confirm it.' }
+    $yes = $children | Where-Object { $_.Current.Name -eq 'Yes' } | Select-Object -First 1
+    if (-not $yes) { throw 'Yes button not found in Figma overwrite prompt.' }
+    [FigmaSaveDialog]::PostMessage([IntPtr]$yes.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $result = 'dialog'
+    break
+  }
+  $saveDialog = $items | Where-Object { $_.Current.ClassName -eq '#32770' } | Select-Object -First 1
+  if ($saveDialog) {
+    $controls = $saveDialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $save = $controls | Where-Object { $_.Current.Name -eq 'Save' -and $_.Current.ClassName -eq 'Button' } | Select-Object -First 1
+    if (-not $save) { throw 'Save button not found in Figma Save dialog.' }
+    if (-not $saveClicked) {
+      if (-not [FigmaSaveDialog]::PostMessage([IntPtr]$save.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)) { throw 'Could not submit Figma Save dialog.' }
+      $saveClicked = $true
+    }
+  } elseif ($saveClicked) {
+    $result = 'dialog'
+    break
+  }
+  Start-Sleep -Milliseconds 100
+}
+$result
+`;
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+    { timeout: 35_000, windowsHide: true }
+  );
+  if (!stdout.trim().endsWith("download") && !stdout.trim().endsWith("dialog")) {
+    throw "Could not determine how Figma opened Save local copy: ${stdout.trim()}";
+  }
+}
+
+async function triggerFigmaSaveLocalCopy(fileName: string): Promise<void> {
+  if (process.platform === "win32") {
+    await triggerFigmaSaveViaCdp(fileName);
+    await completeWindowsSaveDialog(fileName);
+    return;
+  }
+
   if (process.platform === "darwin") {
     const script = [
       'tell application "Figma" to activate',
@@ -76,25 +324,6 @@ async function triggerFigmaSaveLocalCopy(): Promise<void> {
       "end tell",
     ].join("\n");
     await execFileAsync("osascript", ["-e", script], { timeout: 15_000 });
-    return;
-  }
-
-  if (process.platform === "win32") {
-    const script = [
-      "$ws = New-Object -ComObject WScript.Shell",
-      'if (-not $ws.AppActivate("Figma")) { throw "Could not activate the Figma desktop app." }',
-      "Start-Sleep -Milliseconds 500",
-      '$ws.SendKeys("^k")',
-      "Start-Sleep -Milliseconds 1000",
-      '$ws.SendKeys("Save local copy")',
-      "Start-Sleep -Milliseconds 1000",
-      '$ws.SendKeys("{ENTER}")',
-    ].join("; ");
-    await execFileAsync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-      { timeout: 15_000, windowsHide: true }
-    );
     return;
   }
 
@@ -163,11 +392,14 @@ export async function exportNativeFigFile(
   }
 
   const downloadDir = path.join(homedir(), "Downloads");
+  if (existsSync(destination)) {
+    throw new Error(`Refusing to overwrite existing file: ${destination}`);
+  }
   const before = await listFigFiles(downloadDir);
   const baseline = new Map(before.map((file) => [file.path, `${file.size}:${file.mtimeMs}`]));
   const startedAt = Date.now();
 
-  await triggerFigmaSaveLocalCopy();
+  await triggerFigmaSaveLocalCopy(fileName);
 
   const downloaded = await waitForFigDownload(
     downloadDir,
@@ -188,6 +420,7 @@ export async function exportNativeFigFile(
   try {
     await mkdir(path.dirname(destination), { recursive: true });
     await copyFile(downloaded.path, destination, constants.COPYFILE_EXCL);
+    await unlink(downloaded.path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "EEXIST") {
@@ -201,8 +434,6 @@ export async function exportNativeFigFile(
     throw error;
   }
 
-  // Keep the original Downloads copy intact; exporting elsewhere must not
-  // silently remove the file Figma just created.
   return {
     outputPath: destination,
     bytesWritten: downloaded.size,
@@ -213,16 +444,20 @@ export async function exportNativeFigFile(
 export function registerFigExportTool(server: McpServer): void {
   server.tool(
     "export_fig",
-    "Save the active Figma desktop document as a native .fig file and copy the completed download to outputPath (the original Downloads file is kept). This uses Figma's File > Save local copy action; the intended document must be the active Figma window. Supported on macOS and Windows only.",
+    "Save the named Figma desktop document as a native .fig file and move the completed download from Downloads to outputPath. On Windows this uses Figma CDP and its File > Save local copy action without requiring the Figma window to be focused. Launch Figma with FIGMA_TEST=1 and --remote-debugging-port=9222. Supported on macOS and Windows only.",
     {
       fileName: z
         .string()
         .min(1)
-        .describe("Exact Figma document name (without .fig); used to identify the downloaded native file."),
+        .describe(
+          "Exact Figma document name (without .fig); used to identify the downloaded native file."
+        ),
       outputPath: z
         .string()
         .min(1)
-        .describe("Destination .fig path; relative paths resolve from the MCP server working directory."),
+        .describe(
+          "Destination .fig path; relative paths resolve from the MCP server working directory."
+        ),
       timeoutMs: z
         .number()
         .int()
